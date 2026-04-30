@@ -16,14 +16,14 @@
 
 ## 必做 (Minimum Requirement)
 
-- [ ] Gateway 監聽 `:8080`
-- [ ] Path-based routing 到對應後端
+- [x] Gateway 監聽 `:8080`
+- [x] Path-based routing 到對應後端
   - `/api/users/**` → `localhost:8081`
   - `/api/orders/**` → `localhost:8082`
   - `/api/products/**` → `localhost:8083`
-- [ ] 保留原始 path、method、header、body
-- [ ] Gateway 加進 `docker-compose.yml`(或至少能本地跑起來)
-- [ ] 用 curl 驗證三條路線都通
+- [x] 保留原始 path、method、header、body
+- [x] Gateway 本地跑(`go run ./cmd`,連 docker compose 起的 host port)
+- [x] 用 curl 驗證三條路線都通
 
 ## Bonus(依 CP 值排序,40 分鐘內挑著做)
 
@@ -35,15 +35,50 @@
 - [x] Graceful shutdown(收到 SIGTERM 10s drain)
 
 ### 中等
-- [ ] Rate limiting(token bucket,per-IP 或 global)
-- [ ] Retry(只對冪等方法 GET/HEAD)
-- [ ] CORS
+
+- [ ] **Rate limiting**(token bucket,per-IP 或 global)
+  - **目的**:保護 backend,防止被單一 client 打爆;在 gateway 集中限流,backend 不用各自實作。
+  - **放哪**:`internal/middleware/rate_limit.go`,在 logger 之後、proxy 之前。
+  - **怎麼做**:`golang.org/x/time/rate.Limiter`;per-IP 用 `map[string]*Limiter` + `sync.RWMutex`,production 要包 LRU 或 TTL 防 memory leak。
+  - **觸發限制**:回 429,header 帶 `Retry-After`。
+
+- [ ] **Retry**(只對冪等方法 GET / HEAD)
+  - **目的**:後端偶發網路抖動 / 5xx 自動重試,不讓 client 看到 transient error。
+  - **放哪**:`internal/repository/http/backend.go`,把 `*ReverseProxy.Transport` 包一層 retry transport(實作 `http.RoundTripper`)。
+  - **限制**:只重 GET / HEAD(冪等);POST / PATCH 重試會雙寫資料。
+  - **注意**:context deadline 要傳遞;backoff 要加 jitter,避免 thundering herd;最多 2-3 次。
+
+- [ ] **CORS**
+  - **目的**:前端跨 origin 打 gateway 時必備;在 gateway 統一處理,backend 不用煩。
+  - **放哪**:`internal/middleware/cors.go`,**logger 之前**(preflight 不需要記 access log)。
+  - **重點**:`OPTIONS` preflight 直接回 204,**不要**轉發到 backend;allowed origins / methods / headers 走 env 設定。
 
 ### 進階(時間夠才做,否則口頭聊)
-- [ ] Circuit breaker
-- [ ] Auth middleware(API key / JWT)
-- [ ] Metrics endpoint(Prometheus `/metrics`)
-- [ ] Load balancing(目前每服務只有 1 instance,意義不大)
+
+- [ ] **Circuit breaker**
+  - **目的**:後端持續失敗時「短路」,直接拒絕請求給後端時間恢復,避免雪崩(cascade failure)。
+  - **放哪**:`internal/service/routing_service.go` 或包進 `repository/http/backend.go`,per-backend 一個 breaker。
+  - **怎麼做**:三態 closed → open → half-open;用 `sony/gobreaker` 或自己寫;觸發條件用「失敗率 + 視窗」。
+  - **跟 retry 的關係**:retry 在 breaker 內側,breaker 開了 retry 也跳過。
+
+- [ ] **Auth middleware**(API key / JWT)
+  - **目的**:在 gateway 集中認證,backend 信任 gateway 內網流量,不重複實作 auth。
+  - **放哪**:`internal/middleware/auth.go`,proxy 之前;`/health` 走白名單。
+  - **API key**:header `X-API-Key` lookup;簡單但難 rotate。
+  - **JWT**:驗 signature → 解 claims → 塞 context,backend 從 header(`X-User-Id`)讀已驗證身份。
+  - **失敗**:回 401,不洩漏為什麼失敗。
+
+- [ ] **Metrics endpoint**(Prometheus `/metrics`)
+  - **目的**:RED metrics(**R**ate / **E**rrors / **D**uration)per-route 觀測性,搭 Grafana。
+  - **放哪**:`internal/middleware/metrics.go` 量 latency 跟 status;`/metrics` 直接 mount 在 router。
+  - **怎麼做**:`prometheus/client_golang`;`Histogram`(latency)+ `Counter`(req_total);label:`method`、`path_prefix`、`status`。
+  - **注意**:`/metrics` 要在 logger **之前** mount(否則 Prometheus 每秒 scrape 會洗版 access log);label cardinality 不要爆(別用完整 path 當 label)。
+
+- [ ] **Load balancing**(目前每服務只有 1 instance,意義不大,口頭聊)
+  - **目的**:同一個 backend 有多個 instance 時分流。
+  - **放哪**:`internal/repository/http/backend.go`,`HTTPBackend` 從持有單一 `*url.URL` 改成 `[]*url.URL` + selector;`ReverseProxy.Director` 每次請求動態挑 target。
+  - **策略**:round-robin(最簡單)/ random / least-connections / weighted;production 通常是 least-connections + health-aware。
+  - **跟 k8s 的關係**:k8s service 已經做 LB(iptables / IPVS),gateway 端的 LB 在大多數情境是冗餘的;**值得做的時機**是要做 weighted routing(canary)、sticky session、或跨 cluster。
 
 ---
 
